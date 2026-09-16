@@ -23,6 +23,22 @@ python fclean.py clean-paths --list safe.txt --apply --trash-dir D:/__回收站_
 
 ---
 
+## 为什么选它（以及什么时候别用）
+
+同类成熟工具很多：**fclones**（Rust，最快的去重器）、**Czkawka**（功能最全）、**npkill**（专清 `node_modules` / `.next`）。本工具**不跟它们拼速度**，它的定位是 Windows 中文环境下的「**安全 + 可控 + 零门槛**」：
+
+| 你在意的事 | 本工具 | 同类工具 |
+|---|---|---|
+| 删错了还能捞回来 | ✅ 三级兜底进回收站，失败自动还原原位 | ❌ npkill 官方明示无回收站（误删需文件恢复工具）；fclones / rmlint 多为直接删除 |
+| 别把「源码↔产物」误报成重复 | ✅ 构建镜像识别，虚报单独排除 | ❌ 多数按哈希直报，容易虚报"可省 X GB" |
+| 别把 `public` / `dist` 当垃圾删了 | ✅ 发布成品分级，默认不碰 | ⚠️ 多数只提示"敏感目录"，不区分发布成品 |
+| 不想装 node / npm / Rust 工具链 | ✅ 单文件 Python，零第三方依赖 | ❌ 需要 `npx`、装包或下载二进制 |
+| Windows 中文路径 / 隐藏目录 / junction | ✅ 实测适配，踩坑都记在 `references/` | ⚠️ Linux 优先的工具在这里容易翻车 |
+
+**什么时候别用它**：几十万文件以上的全盘去重，或 Linux / macOS 生产环境 —— 请直接用 [fclones](https://github.com/pkolaczk/fclones) 或 `jdupes`，它们快一到两个数量级。本工具是为「**想安全地把确定的东西删掉**」这个场景做的。
+
+---
+
 ## 安装
 
 无第三方依赖，Python 3.8+ 即可：
