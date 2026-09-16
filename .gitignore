@@ -1,0 +1,18 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# macOS / Windows 噪声
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# 本工具自己的扫描产物与回收站
+*_fclean_*.json
+*_fclean_*.csv
+build_safe.txt
+__回收站__/
+fk_stage_*
