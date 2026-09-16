@@ -2,7 +2,7 @@
 name: file-duplicate-cleanup
 description: 扫描并清理目录里的垃圾文件——重复文件（完全重复/双格式/版本冗余/**构建镜像**）/ 0 字节空文件 / 空文件夹 / 大文件 / 临时垃圾 / **构建产物（node_modules/build/.gradle 等，按可重建与发布成品分级）**。内置零依赖工具 fclean.py，默认只扫不动，删除一律走回收站。适用于"找重复文件/清理多余文件/清空文件/0KB 文件/空文件夹/大文件占空间/临时垃圾/清理构建产物/清理垃圾"类需求。
 agent_created: true
-version: 1.2.0
+version: 1.3.0
 ---
 
 # 文件清理（重复文件 / 空文件·空文件夹 / 大文件 / 临时垃圾 / 构建产物）
@@ -74,7 +74,11 @@ FC="<skill目录>/scripts/fclean.py"
   - `clean --report out_build.json` 默认也只删 safe，`--include-output` 才动成品。
   - 实测：某项目堆 **22 个构建目录 / 2.41 GB**（可重建 2.34 GB）——**这是"重复文件"扫描完全查不到的空间**。
 - **构建镜像识别（关键）**：工具自动把「源码↔产物」重复（`source`/`static`/`themes` ↔ `public`/`dist`/`_site`，去标记后后缀相同）标为 `build-mirror`，汇总里单列**真实可省（排除镜像）**；`clean` **默认不删镜像组**（要删加 `--include-mirror`）。实测某项目虚报可省 1589 MB，排除镜像后真实仅 1.69 MB——没有这层识别，报告会严重误导。
-- 关键参数：`--keep first|newest|oldest|shortest`、`--min-size`、`--skip-names`、`--skip-paths`、`--strict`（目录指纹纳入内容哈希）、`--all-levels`、`--exclude-mirror`、`--min-age-days`、`--cats`。
+- 关键参数：`--keep first|newest|oldest|shortest`、`--min-size`、`--skip-names`、`--skip-paths`、`--strict`（目录指纹纳入内容哈希）、`--all-levels`、`--exclude-mirror`、`--min-age-days`、`--cats`、`--tail-size`、`--cache`、`--link`。
+- **学自 fclones 的三处优化（v1.3.0）**：
+  - **末尾哈希剪枝**（`--tail-size`，默认 4096，`0`=关闭）：开头相同但结尾不同的文件在这层被淘汰，不用整篇重读。
+  - **哈希缓存**（`--cache <db>`，**默认关闭**）：SQLite 存哈希，只要文件的 size+mtime 没变就复用。**实测边界（重要，别乱开）**：大文件/慢盘收益巨大（2×200MB 相同文件 `0.70s → 0.00s`）；但**小目录反而亏**——只有 2 组重复时 `0.0s → 0.1s`（查库开销 > 重算哈希）。→ **只在反复扫同一批大文件时开**。
+  - **硬链接去重**（`clean --link hard`）：副本路径全保留、磁盘只占一份（`os.link()`，零依赖）。**⚠ 硬链接不是备份**——改其中一个另一个也跟着变；**跨驱动器必然失败**（实测 `WinError 17`），工具会检测并跳过、不动原文件。
 - 删除通道：给了 `--trash-dir` 就移进该目录的 `<use>_<日期>/`（**同盘改名，秒完成、可还原**）；否则走**系统回收站**（send2trash → 同盘改名到非隐藏临时名再删 → ctypes `SHFileOperationW` 兜底，失败自动还原）。
 - **返回值是元组**：`recycle_delete(p)` 返回 `(ok, detail)`（如 `(True,'stage+send2trash')`）。调用方判成功必须取 `r[0]`，**不要 `if r:`**（元组非空恒为真，会把失败当成功）。
 - **性能红线（2026-09-16 实测）**：系统回收站对**文件数多**的目录极慢——2000 文件/39MB 耗时 **114.6s**（≈57ms/文件，Windows 逐个入 $Recycle.Bin）；而**同盘 `--trash-dir` 移动同样的目录只要 0.002s**（差 5.7 万倍）。

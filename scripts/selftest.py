@@ -392,6 +392,55 @@ def main():
         check("clean(build) 默认删 safe、保留 public",
               not os.path.isdir(os.path.join(p9, "node_modules")) and os.path.isdir(os.path.join(p9, "public")),
               "safe 删除/成品保留失败")
+
+        print("\n=== 10) 末尾哈希剪枝 / 哈希缓存 / 硬链接去重 ===")
+        p10 = os.path.join(base, "p10")
+        os.makedirs(p10, exist_ok=True)
+        head = b"H" * 5000
+        # 头相同、尾不同的两个文件：应在「末尾哈希」这层被淘汰，不算重复
+        with open(os.path.join(p10, "same_head_a.bin"), "wb") as f:
+            f.write(head + b"AAAA-tail")
+        with open(os.path.join(p10, "same_head_b.bin"), "wb") as f:
+            f.write(head + b"BBBB-tail")
+        # 头尾都相同的两个文件：应判为真重复
+        same = head + b"ZZZZ-tail"
+        for n in ("dupC.bin", "dupD.bin"):
+            with open(os.path.join(p10, n), "wb") as f:
+                f.write(same)
+
+        run("scan-dupes", "--root", p10, "--out", out("c10"), "--prefix", "1000", "--tail-size", "64")
+        rd = load(out("c10"))
+        gp = sorted(p for g in rd["groups"] for p in g["paths"])
+        check("末尾不同 -> 不算重复（该层剪掉）",
+              not any("same_head_" in p for p in gp), str(gp))
+        check("头尾都相同 -> 判为重复",
+              len(rd["groups"]) == 1 and len(rd["groups"][0]["paths"]) == 2, str(rd["groups"])[:200])
+
+        # 哈希缓存：第一次全 miss，第二次应命中
+        cache_db = os.path.join(base, "c10.db")
+        run("scan-dupes", "--root", p10, "--out", out("c10a"), "--prefix", "1000",
+            "--tail-size", "64", "--cache", cache_db)
+        r1 = load(out("c10a"))
+        run("scan-dupes", "--root", p10, "--out", out("c10b"), "--prefix", "1000",
+            "--tail-size", "64", "--cache", cache_db)
+        r2 = load(out("c10b"))
+        check("缓存首次：全未命中", r1.get("cache_hits", 0) == 0 and r1.get("cache_misses", 0) > 0,
+              str((r1.get("cache_hits"), r1.get("cache_misses"))))
+        check("缓存二次：命中 >0", r2.get("cache_hits", 0) > 0, str(r2.get("cache_hits")))
+        check("带缓存与不带缓存结果一致",
+              r1["group_count"] == r2["group_count"] == 1, str((r1["group_count"], r2["group_count"])))
+
+        # 硬链接去重：路径保留、磁盘共用一份
+        fa = os.path.join(p10, "dupC.bin")
+        fb = os.path.join(p10, "dupD.bin")
+        run("clean", "--report", out("c10a"), "--link", "hard")  # 预演
+        check("硬链接预演不改动", os.stat(fa).st_ino != os.stat(fb).st_ino)
+        run("clean", "--report", out("c10a"), "--link", "hard", "--apply")
+        check("硬链接后两个路径都还在", os.path.exists(fa) and os.path.exists(fb))
+        if os.path.exists(fa) and os.path.exists(fb):
+            check("硬链接后共用一份数据（inode 相同）",
+                  os.stat(fa).st_ino == os.stat(fb).st_ino, str((os.stat(fa).st_ino, os.stat(fb).st_ino)))
+            check("硬链接数 >=2", os.stat(fa).st_nlink >= 2, str(os.stat(fa).st_nlink))
     finally:
         shutil.rmtree(base, ignore_errors=True)
 

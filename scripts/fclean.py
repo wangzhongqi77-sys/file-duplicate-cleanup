@@ -31,7 +31,7 @@ import uuid
 from collections import Counter, defaultdict
 from datetime import datetime
 
-VERSION = "1.2.0"
+VERSION = "1.3.0"
 
 # ---------------------------------------------------------------- 扩展名分类
 IMG = {'.jpg', '.jpeg', '.png', '.gif', '.bmp', '.webp', '.heic', '.heif',
@@ -193,6 +193,78 @@ def file_hash(path, limit=None, chunk=1 << 20, algo="md5"):
     return h.hexdigest()
 
 
+def file_tail_hash(path, tail=1 << 12, algo="md5"):
+    """读文件**末尾** tail 字节算哈希。
+
+    学自 fclones：两个文件「开头前缀」相同不代表内容相同（日志文件追加、
+    尾部元数据不同的图片/视频都属此类）。先看一眼尾巴，尾巴不同就直接淘汰，
+    省掉整个文件的全量哈希 —— 对 GB 级大文件特别值。
+    """
+    h = hashlib.new(algo)
+    with open(path, "rb") as f:
+        f.seek(0, os.SEEK_END)
+        pos = f.tell()
+        f.seek(max(0, pos - tail), os.SEEK_SET)
+        while True:
+            b = f.read(min(1 << 20, tail))
+            if not b:
+                break
+            h.update(b)
+    return h.hexdigest()
+
+
+class HashCache:
+    """扫描哈希的持久化缓存（学自 fclones / Czkawka）。
+
+    以 (路径, 阶段, 算法) 为主键缓存哈希；**命中条件是该文件的 size 与 mtime
+    都没变过**，变了就当作失效重新计算。这样第二次扫同一目录基本不用再读文件内容。
+    用的是 Python 标准库 sqlite3 —— 不引入第三方依赖。
+    """
+
+    def __init__(self, path):
+        import sqlite3  # 标准库，按需导入：不用缓存时完全不碰它
+        self.path = path
+        self.conn = sqlite3.connect(path)
+        self.conn.execute(
+            "CREATE TABLE IF NOT EXISTS hash_cache ("
+            " path TEXT NOT NULL, stage TEXT NOT NULL, algo TEXT NOT NULL,"
+            " size INTEGER NOT NULL, mtime REAL NOT NULL, hash TEXT NOT NULL,"
+            " PRIMARY KEY (path, stage, algo))")
+        self.hits = 0
+        self.misses = 0
+        self._pending = []
+
+    def get(self, path, stage, algo, size, mtime):
+        row = self.conn.execute(
+            "SELECT hash FROM hash_cache WHERE path=? AND stage=? AND algo=?"
+            " AND size=? AND mtime=?", (path, stage, algo, size, mtime)).fetchone()
+        if row is None:
+            self.misses += 1
+            return None
+        self.hits += 1
+        return row[0]
+
+    def put(self, path, stage, algo, size, mtime, digest):
+        self._pending.append((path, stage, algo, size, mtime, digest))
+        if len(self._pending) >= 500:
+            self.flush()
+
+    def flush(self):
+        if not self._pending:
+            return
+        self.conn.executemany(
+            "INSERT OR REPLACE INTO hash_cache VALUES (?,?,?,?,?,?)", self._pending)
+        self._pending = []
+        self.conn.commit()
+
+    def close(self):
+        try:
+            self.flush()
+            self.conn.close()
+        except Exception:
+            pass
+
+
 # ---------------------------------------------------------------- 模式二：空文件/空目录
 def cmd_scan_empty(args):
     ext_filter = ALL_EXT if not args.any else None
@@ -246,8 +318,27 @@ def is_build_mirror(paths):
     return bool(pub & src)
 
 
-def find_dupes(files, min_size=1, prefix=1 << 16, algo="md5"):
-    """fclones 式流水线。返回 group 列表。"""
+def find_dupes(files, min_size=1, prefix=1 << 16, algo="md5",
+               tail=1 << 12, cache=None):
+    """fclones 式流水线（含「末尾哈希」剪枝 + 可选哈希缓存）。返回 (group 列表, 跳过的硬链接数)。
+
+    阶段：按大小分组 -> inode 去重 -> 开头前缀哈希 -> **末尾哈希剪枝** -> 全量哈希。
+    cache 给定时，每阶段的哈希先查缓存（命中条件：size 与 mtime 都没变），省掉读文件。
+    """
+    head_stage = "head:%d" % prefix
+    tail_stage = "tail:%d" % tail
+
+    def H(fr, stage, fn):
+        """带缓存的哈希：size+mtime 未变则直接复用上次结果，不读文件内容。"""
+        if cache is not None:
+            got = cache.get(fr.path, stage, algo, fr.size, fr.mtime)
+            if got is not None:
+                return got
+        v = fn()
+        if cache is not None:
+            cache.put(fr.path, stage, algo, fr.size, fr.mtime, v)
+        return v
+
     by_size = defaultdict(list)
     seen_inode = set()
     dup_hardlinks = 0
@@ -268,7 +359,8 @@ def find_dupes(files, min_size=1, prefix=1 << 16, algo="md5"):
         pre = defaultdict(list)
         for fr in recs:
             try:
-                pre[file_hash(fr.path, limit=prefix, algo=algo)].append(fr)
+                pre[H(fr, head_stage,
+                      lambda p=fr.path: file_hash(p, limit=prefix, algo=algo))].append(fr)
             except OSError:
                 continue
         for h, rs in pre.items():
@@ -278,16 +370,31 @@ def find_dupes(files, min_size=1, prefix=1 << 16, algo="md5"):
                 groups.append({"size": size, "hash": h, "stage": "prefix",
                                "paths": [r.path for r in rs]})
                 continue
-            full = defaultdict(list)
-            for fr in rs:
-                try:
-                    full[file_hash(fr.path, algo=algo)].append(fr)
-                except OSError:
+            # 末尾哈希剪枝：尾巴不在前缀范围内时先看尾巴，不同就在这层淘汰，省掉全量读
+            buckets = [rs]
+            if tail and size > prefix + tail:
+                tails = defaultdict(list)
+                for fr in rs:
+                    try:
+                        tails[H(fr, tail_stage,
+                                lambda p=fr.path: file_tail_hash(p, tail=tail, algo=algo))].append(fr)
+                    except OSError:
+                        continue
+                buckets = [v for v in tails.values() if len(v) >= 2]
+                if not buckets:
                     continue
-            for fh, fs in full.items():
-                if len(fs) >= 2:
-                    groups.append({"size": size, "hash": fh, "stage": "full",
-                                   "paths": [r.path for r in fs]})
+            for rs2 in buckets:
+                full = defaultdict(list)
+                for fr in rs2:
+                    try:
+                        full[H(fr, "full",
+                               lambda p=fr.path: file_hash(p, algo=algo))].append(fr)
+                    except OSError:
+                        continue
+                for fh, fs in full.items():
+                    if len(fs) >= 2:
+                        groups.append({"size": size, "hash": fh, "stage": "full",
+                                       "paths": [r.path for r in fs]})
     for g in groups:
         g["kind"] = "build-mirror" if is_build_mirror(g["paths"]) else "normal"
     groups.sort(key=lambda g: (-g["size"], g["paths"][0].lower()))
@@ -300,10 +407,17 @@ def cmd_scan_dupes(args):
         ext_filter = {("." + e.lower().lstrip('.')) for e in args.ext.split(',') if e.strip()}
     skip = set(DEFAULT_SKIP_NAMES) | {x.strip().lower() for x in args.skip_names.split(',') if x.strip()}
     skip_paths = norm_skip_paths(args.skip_paths)
+    cache = HashCache(args.cache) if getattr(args, "cache", None) else None
     t0 = time.time()
     data = scan_tree(args.root, skip, skip_paths, ext_filter=ext_filter)
-    all_groups, hardlinks = find_dupes(data["files"], min_size=args.min_size,
-                                       prefix=args.prefix, algo=args.hash)
+    try:
+        all_groups, hardlinks = find_dupes(data["files"], min_size=args.min_size,
+                                           prefix=args.prefix, algo=args.hash,
+                                           tail=getattr(args, "tail_size", 1 << 12),
+                                           cache=cache)
+    finally:
+        if cache is not None:
+            cache.close()
     mirror = [g for g in all_groups if g["kind"] == "build-mirror"]
     groups = ([g for g in all_groups if g["kind"] != "build-mirror"]
               if args.exclude_mirror else all_groups)
@@ -322,6 +436,9 @@ def cmd_scan_dupes(args):
         "wasted_bytes_excluding_mirror": waste([g for g in all_groups if g["kind"] != "build-mirror"]),
         "exclude_mirror": bool(args.exclude_mirror),
         "hardlink_skipped": hardlinks,
+        "cache_enabled": cache is not None,
+        "cache_hits": (cache.hits if cache is not None else 0),
+        "cache_misses": (cache.misses if cache is not None else 0),
         "groups": groups,
     }
     print_summary_dupes(payload)
@@ -959,6 +1076,66 @@ def select_dir_targets(identical_groups):
     return out, keepers
 
 
+def dupe_link_pairs(groups, keep="first"):
+    """为「硬链接去重」生成 (保留文件路径, 待处理文件路径) 配对列表。"""
+    pairs = []
+    for g in groups:
+        paths = list(g.get("paths", []))
+        if len(paths) < 2:
+            continue
+        k = choose_keeper(paths, keep)
+        for p in paths:
+            if p != k:
+                pairs.append((k, p))
+    return pairs
+
+
+def hardlink_replace(keeper, target, dry=True):
+    """把 target 换成指向 keeper 的硬链接：路径还在、看着没变，但磁盘只占一份数据。
+
+    ⚠ 硬链接**不是备份**：改其中任何一个，另一个也跟着变。
+
+    采用「先建后删」的安全顺序：先在同目录建好链接（临时名）并校验 inode，
+    确认无误后才把原文件送进回收站，最后让链接版本补上名字。
+    任一步出错都会清掉临时文件，原文件不会被碰。
+
+    返回 (结果, 说明)：True=成功/可成功，False=失败，None=有意跳过。
+    """
+    try:
+        ks, ts = os.stat(keeper), os.stat(target)
+    except OSError as e:
+        return False, "读文件信息失败: %s" % e.strerror
+    if getattr(ks, "st_dev", 0) != getattr(ts, "st_dev", 0):
+        return None, "跨盘/跨卷（Windows 不支持跨驱动器硬链接）"
+    if ks.st_ino == ts.st_ino:
+        return None, "已经是同一份数据，无需处理"
+    tmp = target + ".fclean_link_tmp"
+    if os.path.exists(tmp):
+        try:
+            os.remove(tmp)
+        except OSError:
+            pass
+    try:
+        os.link(keeper, tmp)
+        if os.stat(tmp).st_ino != ks.st_ino:
+            raise OSError("链接校验失败")
+        if dry:
+            os.remove(tmp)
+            return True, "可链接（inode=%d）" % ks.st_ino
+        ok, detail = recycle_delete(target)
+        if not ok:
+            raise OSError("原文件未能安全移走: %s" % detail)
+        os.replace(tmp, target)
+        return True, "已指向同一份数据（原文件进回收站，可还原）"
+    except OSError as e:
+        try:
+            if os.path.exists(tmp):
+                os.remove(tmp)
+        except OSError:
+            pass
+        return False, str(e).replace("[Errno ", "")[:120]
+
+
 def cmd_clean(args):
     with open(args.report, encoding="utf-8") as f:
         rep = json.load(f)
@@ -996,6 +1173,41 @@ def cmd_clean(args):
             print("  留: %s" % k)
     if mode == "dirdupes" and keepers:
         print("!! 等价目录清理：每组保留第一个，将删除 %d 个整目录（可还原，务必先看清单）" % len(files))
+
+    if mode == "dupes" and getattr(args, "link", "none") == "hard":
+        pairs = dupe_link_pairs(gs, args.keep)
+        print("模式: 硬链接去重 | 动作: %s | 配对: %d 个（保留策略=%s）"
+              % ("实做" if args.apply else "预演(不动)", len(pairs), args.keep))
+        print("注意：硬链接不是备份——改其中任意一个，另一个也跟着变；"
+              "跨驱动器 / 不支持硬链接的文件系统会自动跳过，原文件不动。")
+        c = Counter()
+        fails = []
+        for keep_path, tgt in pairs:
+            if not os.path.exists(tgt):
+                c["missing"] += 1
+                continue
+            r, msg = hardlink_replace(keep_path, tgt, dry=not args.apply)
+            if r is True:
+                c["linked"] += 1
+            elif r is None:
+                c["skipped"] += 1
+            else:
+                c["failed"] += 1
+                fails.append((tgt, msg))
+            done_n = c["linked"] + c["skipped"] + c["failed"]
+            if done_n % max(1, args.batch) == 0:
+                print("  [%d/%d] 成功 %d | 跳过 %d | 失败 %d"
+                      % (done_n, len(pairs), c["linked"], c["skipped"], c["failed"]))
+            if c["failed"]:
+                print("  !! 出现失败，停止后续")
+                break
+        print("\n=== %s ===" % ("硬链接结果" if args.apply else "预演结果"))
+        for kk in ("linked", "skipped", "missing", "failed"):
+            if c[kk]:
+                print("  %-8s %d" % (kk, c[kk]))
+        for fp, fe in fails[:30]:
+            print("  FAIL %s => %s" % (fp, fe))
+        return {"stats": dict(c), "failures": fails}
 
     channel = "trashdir" if args.trash_dir else "recycle"
     date = datetime.now().strftime("%Y%m%d")
@@ -1178,6 +1390,12 @@ def build_parser():
     p.add_argument("--min-size", type=int, default=1, help="最小参与字节数（默认 1）")
     p.add_argument("--prefix", type=int, default=1 << 16, help="前缀哈希长度（默认 65536）")
     p.add_argument("--hash", default="md5", help="哈希算法（默认 md5）")
+    p.add_argument("--tail-size", type=int, default=1 << 12,
+                   help="末尾哈希字节数（默认 4096）。在全量读之前先看一眼尾巴做剪枝，"
+                        "开头相同但结尾不同的文件会在这层被淘汰，不必整个重读。0=关闭该剪枝")
+    p.add_argument("--cache", default="",
+                   help="哈希缓存的 SQLite 文件路径（**给了才启用**）。第二次扫同一目录时，"
+                        "只要文件的大小和修改时间没变就直接复用上次的哈希，几乎不用再读文件内容")
     p.add_argument("--exclude-mirror", action="store_true",
                    help="排除「源码↔构建产物」镜像重复（推荐，避免误报）")
     p.set_defaults(func=cmd_scan_dupes, mode="dupes")
@@ -1232,6 +1450,10 @@ def build_parser():
                    help="配合 scan-build 报告：连「⚠发布成品」目录也一起删（默认跳过）")
     p.add_argument("--delete-identical-dirs", action="store_true",
                    help="配合 scan-dirdupes：删掉完全等价目录组里除第一个外的整目录")
+    p.add_argument("--link", choices=["none", "hard"], default="none",
+                   help="none=删掉多余副本（默认，走回收站可还原）；"
+                        "hard=把多余副本换成硬链接：路径都还在、磁盘只占一份。"
+                        "注意硬链接不是备份，改一个另一个也变；跨驱动器会自动跳过")
     p.add_argument("--batch", type=int, default=10, help="每批数量，失败即停（默认 10）")
     p.set_defaults(func=cmd_clean, mode="clean")
 
